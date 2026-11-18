@@ -17,11 +17,25 @@ android {
         versionName = "1.0"
     }
 
+    // In-house app: a fixed key checked into the repo, so every CI build can be
+    // installed as an update over the previous one.
+    signingConfigs {
+        create("inhouse") {
+            storeFile = file("inhouse.p12")
+            storeType = "pkcs12"
+            storePassword = "reelgesture-inhouse"
+            keyAlias = "reelgesture"
+            keyPassword = "reelgesture-inhouse"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("inhouse")
+        }
         release {
             isMinifyEnabled = false
-            // In-house app: sign release with the debug key so it installs without a keystore.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("inhouse")
         }
     }
 
