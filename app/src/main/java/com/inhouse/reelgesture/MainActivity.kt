@@ -11,7 +11,6 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.widget.Button
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -69,16 +68,6 @@ class MainActivity : AppCompatActivity() {
         findViewById<SwitchCompat>(R.id.allowPreviousSwitch).apply {
             isChecked = Prefs.allowPrevious(context)
             setOnCheckedChangeListener { _, checked -> Prefs.setAllowPrevious(context, checked) }
-        }
-        findViewById<SeekBar>(R.id.sensitivitySeek).apply {
-            progress = Prefs.sensitivity(context)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
-                    if (fromUser) Prefs.setSensitivity(context, value)
-                }
-                override fun onStartTrackingTouch(bar: SeekBar) = Unit
-                override fun onStopTrackingTouch(bar: SeekBar) = Unit
-            })
         }
     }
 

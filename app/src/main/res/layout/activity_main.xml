@@ -21,7 +21,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Show two fingers (✌) to the front camera and move them up slightly to go to the next reel. The camera turns off automatically when Instagram is closed or the phone is locked." />
+            android:text="Show ☝ one finger (index up) to the front camera to go to the next reel. Lower your hand, then show it again for the next one. The camera turns off automatically when Instagram is closed or the phone is locked." />
 
         <!-- Step 1 -->
         <TextView
@@ -76,19 +76,7 @@
             android:id="@+id/allowPreviousSwitch"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="✌ moved DOWN = previous reel" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="Sensitivity (right = smaller finger movement needed)" />
-
-        <SeekBar
-            android:id="@+id/sensitivitySeek"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:max="100" />
+            android:text="✌ two fingers = previous reel" />
 
         <!-- Step 3 -->
         <Button

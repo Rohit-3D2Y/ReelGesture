@@ -52,13 +52,13 @@ import kotlin.math.abs
 import kotlin.math.hypot
 
 /**
- * Foreground service that watches the front camera for a two-finger (✌) upward flick
- * and asks [ReelScrollService] to scroll.
+ * Foreground service that watches the front camera for a held hand pose
+ * (☝ index finger up = next reel, ✌ two fingers = previous) and asks [ReelScrollService] to scroll.
  *
  * Battery/CPU budget:
  * - The camera is fully closed while Instagram is not on screen or the phone is locked.
  * - The hand model only runs when the cheap motion check sees movement (idle) or a hand
- *   was seen in the last couple of seconds (active), at low resolution and low frame rate.
+ *   was seen in the last couple of seconds (active), at a low frame rate.
  * - Analysis runs on a background-priority thread so Instagram and audio keep priority.
  *
  * Every failure path degrades to a status message instead of crashing.
@@ -71,15 +71,15 @@ class GestureCameraService : LifecycleService() {
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "com.inhouse.reelgesture.STOP"
 
-        private const val ACTIVE_FRAME_INTERVAL_MS = 90L // ~11 fps while a hand is around
-        private const val IDLE_FRAME_INTERVAL_MS = 250L // 4 cheap motion checks/s otherwise
+        private const val ACTIVE_FRAME_INTERVAL_MS = 66L // ~15 fps while a hand is around
+        private const val IDLE_FRAME_INTERVAL_MS = 150L // ~7 cheap motion checks/s otherwise
         private const val HAND_ACTIVE_HOLD_MS = 2000L
         private const val STUCK_FRAME_TIMEOUT_MS = 1000L
         private const val CAMERA_OFF_DELAY_MS = 1500L
 
         private const val GRID_W = 24
         private const val GRID_H = 18
-        private const val MOTION_THRESHOLD = 6 // mean abs green-channel change, 0..255
+        private const val MOTION_THRESHOLD = 4 // mean abs green-channel change, 0..255
 
         @Volatile
         var isRunning = false
@@ -125,7 +125,6 @@ class GestureCameraService : LifecycleService() {
     private var lastCheckMs = 0L
     private var started = false
     private var failed = false
-    private var poseFrames = 0
 
     // Reused per-frame buffers (analysis thread only) to avoid garbage every frame.
     private var gridPrev = IntArray(GRID_W * GRID_H)
@@ -135,11 +134,7 @@ class GestureCameraService : LifecycleService() {
     private var rotatedBitmap: Bitmap? = null
     private val rotateMatrix = Matrix()
 
-    private val detector = SwipeDetector(
-        threshold = { Prefs.swipeThreshold(this) },
-        allowDown = { Prefs.allowPrevious(this) },
-        onSwipe = { direction -> mainHandler.post { performScroll(direction) } },
-    )
+    private val trigger = PoseTrigger { pose -> mainHandler.post { performScroll(pose) } }
 
     private val applyCameraTask = Runnable { applyCameraState() }
 
@@ -155,7 +150,7 @@ class GestureCameraService : LifecycleService() {
         }
         if (started) return START_NOT_STICKY
 
-        if (!goForeground("Watching for ✌ two fingers")) {
+        if (!goForeground("Watching for ☝ one finger")) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -209,9 +204,9 @@ class GestureCameraService : LifecycleService() {
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumHands(1)
-            .setMinHandDetectionConfidence(0.5f)
-            .setMinHandPresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
+            .setMinHandDetectionConfidence(0.4f)
+            .setMinHandPresenceConfidence(0.4f)
+            .setMinTrackingConfidence(0.4f)
             .setResultListener { result, _ -> onHandResult(result) }
             .setErrorListener { e ->
                 Log.w(TAG, "Hand landmarker error", e)
@@ -260,7 +255,7 @@ class GestureCameraService : LifecycleService() {
                         ResolutionSelector.Builder()
                             .setResolutionStrategy(
                                 ResolutionStrategy(
-                                    Size(320, 240),
+                                    Size(640, 480),
                                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                                 )
                             )
@@ -328,7 +323,7 @@ class GestureCameraService : LifecycleService() {
                     camera.cameraInfo.cameraState.removeObservers(this)
                     camera.cameraInfo.cameraState.observe(this) { state -> onCameraState(state) }
                     cameraBound = true
-                    updateNotification("Watching for ✌ two fingers")
+                    updateNotification("Watching for ☝ one finger")
                 }
             } else if (cameraBound) {
                 provider.unbindAll()
@@ -355,7 +350,7 @@ class GestureCameraService : LifecycleService() {
             error?.code == CameraState.ERROR_CAMERA_DISABLED ->
                 "Camera disabled by device policy"
             error != null -> "Camera error ${error.code} — retrying…"
-            state.type == CameraState.Type.OPEN -> "Running — show ✌ two fingers and move them up"
+            state.type == CameraState.Type.OPEN -> "Running — show ☝ one finger to scroll"
             state.type == CameraState.Type.OPENING ||
                 state.type == CameraState.Type.PENDING_OPEN -> "Opening camera…"
             else -> status
@@ -447,48 +442,57 @@ class GestureCameraService : LifecycleService() {
     private fun onHandResult(result: HandLandmarkerResult) {
         frameInFlightSince = 0L
         try {
+            val time = result.timestampMs()
             val hand = result.landmarks().firstOrNull()
             if (hand == null || hand.size < 21) {
-                poseFrames = 0
-                detector.reset()
+                trigger.update(time, null)
                 handState = "No hand in view"
                 return
             }
             lastHandSeenMs = SystemClock.uptimeMillis()
-            if (!isTwoFingerPose(hand)) {
-                poseFrames = 0
-                detector.reset()
-                handState = "Hand seen — show ✌ two fingers"
-                return
+            var pose = classifyPose(hand)
+            if (pose == PoseTrigger.Pose.TWO_FINGERS && !Prefs.allowPrevious(this)) pose = null
+            trigger.update(time, pose)
+            handState = when {
+                pose == null -> "Hand seen — show ☝ one finger"
+                trigger.waitingForRelease -> "Done — lower your hand to scroll again"
+                pose == PoseTrigger.Pose.ONE_FINGER -> "☝ One finger — scrolling…"
+                else -> "✌ Two fingers — going back…"
             }
-            poseFrames++
-            handState = "✌ Two fingers — move them up"
-            if (poseFrames < 2) return // ignore single-frame pose flickers
-            // Track the index + middle fingertips.
-            val y = (hand[8].y() + hand[12].y()) / 2f
-            detector.add(result.timestampMs(), y)
         } catch (e: Exception) {
             Log.w(TAG, "Bad hand result", e)
         }
     }
 
-    /** Index and middle fingers extended, ring and pinky folded. Thumb is ignored. */
-    private fun isTwoFingerPose(hand: List<NormalizedLandmark>): Boolean {
+    /**
+     * ☝ index up with middle/ring/pinky folded, or ✌ index + middle up with ring/pinky folded.
+     * The thumb is ignored. Fingers must point roughly upward.
+     */
+    private fun classifyPose(hand: List<NormalizedLandmark>): PoseTrigger.Pose? {
         val aspect = frameAspect
         fun distFromWrist(i: Int) =
             hypot((hand[i].x() - hand[0].x()) * aspect, hand[i].y() - hand[0].y())
-        fun extended(tip: Int, pip: Int) = distFromWrist(tip) > distFromWrist(pip) * 1.25f
-        fun folded(tip: Int, pip: Int) = distFromWrist(tip) < distFromWrist(pip) * 1.05f
-        return extended(8, 6) && extended(12, 10) && folded(16, 14) && folded(20, 18)
+        fun extended(tip: Int, pip: Int) = distFromWrist(tip) > distFromWrist(pip) * 1.2f
+        fun folded(tip: Int, pip: Int) = distFromWrist(tip) < distFromWrist(pip) * 1.1f
+        fun pointsUp(tip: Int, mcp: Int) = hand[tip].y() < hand[mcp].y()
+
+        val index = extended(8, 6) && pointsUp(8, 5)
+        val ringPinkyFolded = folded(16, 14) && folded(20, 18)
+        if (!index || !ringPinkyFolded) return null
+        return when {
+            folded(12, 10) -> PoseTrigger.Pose.ONE_FINGER
+            extended(12, 10) && pointsUp(12, 9) -> PoseTrigger.Pose.TWO_FINGERS
+            else -> null
+        }
     }
 
-    private fun performScroll(direction: SwipeDetector.Direction) {
+    private fun performScroll(pose: PoseTrigger.Pose) {
         val scroller = ReelScrollService.instance
         if (scroller == null) {
             status = "Accessibility service is off — enable it in the app"
             return
         }
-        val next = direction == SwipeDetector.Direction.UP
+        val next = pose == PoseTrigger.Pose.ONE_FINGER
         if (scroller.scroll(next, Prefs.instagramOnly(this))) {
             handState = if (next) "Scrolled to next reel" else "Scrolled to previous reel"
         }

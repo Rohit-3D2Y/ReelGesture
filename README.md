@@ -1,17 +1,17 @@
 # Reel Gesture (in-house)
 
-Scroll Instagram Reels hands-free. Show **two fingers (✌)** to the front camera and move them **up** slightly to go to the next reel. You can optionally turn on moving them **down** to go back to the previous reel.
+Scroll Instagram Reels hands-free. Show **☝ one finger** (index up) to the front camera to go to the next reel. Lower your hand and show it again for the next one. You can optionally turn on **✌ two fingers** to go back to the previous reel.
 
 ## How it works
-- `GestureCameraService` is a foreground service with the `camera` type. It reads the front camera at 320×240 and runs the MediaPipe **Hand Landmarker** on the CPU. It looks for a two-finger (✌) pose and tracks the fingertips.
-- `SwipeDetector` turns fingertip movement into UP/DOWN events. It uses a cooldown, and after each swipe it blocks the opposite direction for a short time so your hand's return movement isn't counted as a second swipe.
-- `ReelScrollService` is an Accessibility Service that performs a real on-screen swipe, so Instagram scrolls as if you had touched it.
+- `GestureCameraService` is a foreground service with the `camera` type. It reads the front camera at 640×480 and runs the MediaPipe **Hand Landmarker** on the CPU to recognise a held ☝ or ✌ pose.
+- `PoseTrigger` fires once when a pose is held for 2 frames. It doesn't fire again until the pose goes away, so holding ☝ scrolls exactly one reel.
+- `ReelScrollService` is an Accessibility Service. It asks Instagram's reels pager to scroll one page, the same way TalkBack does. If that isn't available, it performs a real on-screen swipe instead.
 
 ## Stability safeguards
 - All camera, ML, and gesture calls are guarded. A failure shows up as a status message in the app instead of a crash.
 - If another app is using the camera, the service waits and reconnects automatically.
 - The camera is fully closed while Instagram is not on screen or the phone is locked.
-- With no hand in view, only a cheap motion check runs (4 times a second). The hand model wakes up only on movement, at 320×240 and about 11 fps, on a background-priority thread.
+- With no hand in view, only a cheap motion check runs (4 times a second). The hand model wakes up only on movement, at about 15 fps, on a background-priority thread.
 - Only one frame is processed at a time, and stalled frames are dropped. Memory stays flat.
 - The service never restarts itself in a loop. Stop it from the notification or from the app.
 - `gradle.properties` limits the Gradle heap to 2 GB so builds don't starve other processes on the PC.
