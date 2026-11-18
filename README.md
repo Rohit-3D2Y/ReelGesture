@@ -3,8 +3,8 @@
 Scroll Instagram Reels hands-free. Show **two fingers (✌)** to the front camera and move them **up** slightly to go to the next reel. You can optionally turn on moving them **down** to go back to the previous reel.
 
 ## How it works
-- `GestureCameraService` is a foreground service with the `camera` type. It reads the front camera at about 640×480, capped at 15 fps, and runs the MediaPipe **Hand Landmarker** on the CPU. It tracks the palm position over time.
-- `SwipeDetector` turns palm movement into UP/DOWN events. It uses a cooldown, and after each swipe it blocks the opposite direction for a short time so your hand's return movement isn't counted as a second swipe.
+- `GestureCameraService` is a foreground service with the `camera` type. It reads the front camera at 320×240 and runs the MediaPipe **Hand Landmarker** on the CPU. It looks for a two-finger (✌) pose and tracks the fingertips.
+- `SwipeDetector` turns fingertip movement into UP/DOWN events. It uses a cooldown, and after each swipe it blocks the opposite direction for a short time so your hand's return movement isn't counted as a second swipe.
 - `ReelScrollService` is an Accessibility Service that performs a real on-screen swipe, so Instagram scrolls as if you had touched it.
 
 ## Stability safeguards
