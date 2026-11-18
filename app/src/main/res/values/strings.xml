@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Reel Gesture</string>
+    <string name="accessibility_label">Reel Gesture scroller</string>
+    <string name="accessibility_description">Performs a swipe on screen when Reel Gesture sees a hand swipe in front of the camera, so Instagram Reels scroll hands-free. It does not read or store screen content.</string>
+</resources>
