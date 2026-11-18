@@ -39,6 +39,7 @@ class ReelScrollService : AccessibilityService() {
         if (pkg == "com.android.systemui" || pkg == packageName) return
         if (pkg == foregroundPackage) return
         foregroundPackage = pkg
+        cachedPager = null
         onForegroundChanged?.invoke()
     }
 
@@ -49,42 +50,69 @@ class ReelScrollService : AccessibilityService() {
         super.onDestroy()
     }
 
+    /** Instagram's reels pager, found once and reused so each scroll skips the tree search. */
+    private var cachedPager: AccessibilityNodeInfo? = null
+    private val bounds = Rect()
+
+    /** Locate the pager ahead of time (called while a pose is being confirmed). */
+    fun prepare() {
+        try {
+            if (validPager() == null) cachedPager = rootInActiveWindow?.let(this::findPager)
+        } catch (e: Exception) {
+            Log.w(TAG, "Prepare failed", e)
+        }
+    }
+
     /**
-     * Moves one reel. Prefers the app's own accessibility scroll action (clean page change,
-     * same as TalkBack), falling back to a swipe. Returns false if nothing was done.
-     * A downward swipe is only ever sent for "previous" — a stray downward swipe is
-     * what triggers Instagram's pull-to-refresh.
+     * Moves one reel. By default uses the pager's own accessibility scroll action (clean page
+     * change, same as TalkBack), falling back to a swipe; [bySwipe] forces a real swipe.
+     * Returns false if nothing was done. A downward swipe is only ever sent for "previous" —
+     * a stray downward swipe is what triggers Instagram's pull-to-refresh.
      */
-    fun scroll(next: Boolean, instagramOnly: Boolean): Boolean = try {
-        val root = rootInActiveWindow
-        val active = root?.packageName?.toString() ?: foregroundPackage
-        if (instagramOnly && active != Prefs.INSTAGRAM_PACKAGE) {
-            false
-        } else if (root != null && scrollByAction(root, next)) {
-            true
-        } else {
-            val metrics = resources.displayMetrics
-            // Left of centre keeps clear of the like/comment column on the right.
-            val x = metrics.widthPixels * 0.4f
-            val h = metrics.heightPixels.toFloat()
-            val (fromY, toY) = if (next) h * 0.70f to h * 0.25f else h * 0.30f to h * 0.75f
-            val path = Path().apply {
-                moveTo(x, fromY)
-                lineTo(x, toY)
-            }
-            val gesture = GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0, 180))
-                .build()
-            dispatchGesture(gesture, null, null)
+    fun scroll(next: Boolean, instagramOnly: Boolean, bySwipe: Boolean): Boolean = try {
+        val pager = if (bySwipe) null else validPager() ?: rootInActiveWindow?.let(this::findPager)
+        cachedPager = pager
+        val active = pager?.packageName?.toString()
+            ?: rootInActiveWindow?.packageName?.toString()
+            ?: foregroundPackage
+        when {
+            instagramOnly && active != Prefs.INSTAGRAM_PACKAGE -> false
+            pager != null && pager.performAction(
+                if (next) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            ) -> true
+            else -> swipe(next)
         }
     } catch (e: Exception) {
-        Log.w(TAG, "Swipe failed", e)
+        Log.w(TAG, "Scroll failed", e)
         false
     }
 
-    /** Scrolls the largest visible scrollable view (the reels pager) by one page. */
-    private fun scrollByAction(root: AccessibilityNodeInfo, next: Boolean): Boolean {
-        val bounds = Rect()
+    private fun swipe(next: Boolean): Boolean {
+        val metrics = resources.displayMetrics
+        // Left of centre keeps clear of the like/comment column on the right.
+        val x = metrics.widthPixels * 0.4f
+        val h = metrics.heightPixels.toFloat()
+        val (fromY, toY) = if (next) h * 0.70f to h * 0.25f else h * 0.30f to h * 0.75f
+        val path = Path().apply {
+            moveTo(x, fromY)
+            lineTo(x, toY)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 150))
+            .build()
+        return dispatchGesture(gesture, null, null)
+    }
+
+    /** The cached pager if it is still on screen and still a full-screen scroller. */
+    private fun validPager(): AccessibilityNodeInfo? {
+        val node = cachedPager ?: return null
+        val ok = node.refresh() && node.isVisibleToUser && node.isScrollable && isFullScreen(node)
+        if (!ok) cachedPager = null
+        return if (ok) node else null
+    }
+
+    /** The largest visible scrollable view, if it covers most of the screen (the reels pager). */
+    private fun findPager(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var best: AccessibilityNodeInfo? = null
         var bestArea = 0
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -103,14 +131,12 @@ class ReelScrollService : AccessibilityService() {
             }
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.addLast(it) }
         }
-        // Only trust it if it covers most of the screen, i.e. it's the full-screen reels pager.
+        return best?.takeIf { isFullScreen(it) }
+    }
+
+    private fun isFullScreen(node: AccessibilityNodeInfo): Boolean {
+        node.getBoundsInScreen(bounds)
         val metrics = resources.displayMetrics
-        if (best == null || bestArea < metrics.widthPixels * metrics.heightPixels / 2) return false
-        val action = if (next) {
-            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-        } else {
-            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
-        }
-        return best.performAction(action)
+        return bounds.width() * bounds.height() >= metrics.widthPixels * metrics.heightPixels / 2
     }
 }

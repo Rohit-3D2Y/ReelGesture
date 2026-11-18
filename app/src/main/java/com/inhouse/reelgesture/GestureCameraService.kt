@@ -59,7 +59,6 @@ import kotlin.math.hypot
  * - The camera is fully closed while Instagram is not on screen or the phone is locked.
  * - The hand model only runs when the cheap motion check sees movement (idle) or a hand
  *   was seen in the last couple of seconds (active), at a low frame rate.
- * - Analysis runs on a background-priority thread so Instagram and audio keep priority.
  *
  * Every failure path degrades to a status message instead of crashing.
  */
@@ -71,8 +70,9 @@ class GestureCameraService : LifecycleService() {
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "com.inhouse.reelgesture.STOP"
 
-        private const val ACTIVE_FRAME_INTERVAL_MS = 66L // ~15 fps while a hand is around
-        private const val IDLE_FRAME_INTERVAL_MS = 150L // ~7 cheap motion checks/s otherwise
+        // While a hand is around, run the model on every frame it can keep up with.
+        private const val ACTIVE_FRAME_INTERVAL_MS = 0L
+        private const val IDLE_FRAME_INTERVAL_MS = 100L // 10 cheap motion checks/s otherwise
         private const val HAND_ACTIVE_HOLD_MS = 2000L
         private const val STUCK_FRAME_TIMEOUT_MS = 1000L
         private const val CAMERA_OFF_DELAY_MS = 1500L
@@ -93,6 +93,11 @@ class GestureCameraService : LifecycleService() {
         /** Live hand-tracking readout for the UI. */
         @Volatile
         var handState: String = ""
+            private set
+
+        /** Speed readout for the UI: model time per frame and last pose-to-scroll delay. */
+        @Volatile
+        var speedInfo: String = ""
             private set
 
         @Volatile
@@ -134,7 +139,11 @@ class GestureCameraService : LifecycleService() {
     private var rotatedBitmap: Bitmap? = null
     private val rotateMatrix = Matrix()
 
-    private val trigger = PoseTrigger { pose -> mainHandler.post { performScroll(pose) } }
+    private val trigger = PoseTrigger { pose, frameTimeMs ->
+        mainHandler.postAtFrontOfQueue { performScroll(pose, frameTimeMs) }
+    }
+    @Volatile private var modelMsAvg = 0f
+    @Volatile private var lastScrollDelayMs = -1L
 
     private val applyCameraTask = Runnable { applyCameraState() }
 
@@ -162,7 +171,7 @@ class GestureCameraService : LifecycleService() {
 
         analysisExecutor = Executors.newSingleThreadExecutor { runnable ->
             Thread({
-                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
                 runnable.run()
             }, "gesture-analysis")
         }
@@ -279,7 +288,7 @@ class GestureCameraService : LifecycleService() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** The lowest supported front-camera frame-rate range that still reaches 10 fps. */
+    /** The lowest supported front-camera frame-rate range that still reaches 15 fps. */
     private fun lowFpsRange(): Range<Int>? = try {
         val manager = getSystemService(CameraManager::class.java)
         val frontId = manager?.cameraIdList?.firstOrNull {
@@ -289,7 +298,7 @@ class GestureCameraService : LifecycleService() {
         frontId?.let { id ->
             manager.getCameraCharacteristics(id)
                 .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                ?.filter { it.upper >= 10 }
+                ?.filter { it.upper >= 15 }
                 ?.minWithOrNull(compareBy<Range<Int>>({ it.upper }, { -it.lower }))
         }
     } catch (e: Exception) {
@@ -443,6 +452,9 @@ class GestureCameraService : LifecycleService() {
         frameInFlightSince = 0L
         try {
             val time = result.timestampMs()
+            val modelMs = (SystemClock.uptimeMillis() - time).toFloat()
+            modelMsAvg = if (modelMsAvg == 0f) modelMs else modelMsAvg * 0.8f + modelMs * 0.2f
+            updateSpeedInfo()
             val hand = result.landmarks().firstOrNull()
             if (hand == null || hand.size < 21) {
                 trigger.update(time, null)
@@ -450,9 +462,14 @@ class GestureCameraService : LifecycleService() {
                 return
             }
             lastHandSeenMs = SystemClock.uptimeMillis()
-            var pose = classifyPose(hand)
+            val detection = classifyPose(hand)
+            var pose = detection?.pose
             if (pose == PoseTrigger.Pose.TWO_FINGERS && !Prefs.allowPrevious(this)) pose = null
-            trigger.update(time, pose)
+            // Find Instagram's reels pager ahead of time so the scroll itself is instant.
+            if (pose != null && !trigger.waitingForRelease) {
+                mainHandler.post { ReelScrollService.instance?.prepare() }
+            }
+            trigger.update(time, pose, detection?.strong == true)
             handState = when {
                 pose == null -> "Hand seen — show ☝ one finger"
                 trigger.waitingForRelease -> "Done — lower your hand to scroll again"
@@ -464,38 +481,58 @@ class GestureCameraService : LifecycleService() {
         }
     }
 
+    private class Detection(val pose: PoseTrigger.Pose, val strong: Boolean)
+
     /**
      * ☝ index up with middle/ring/pinky folded, or ✌ index + middle up with ring/pinky folded.
-     * The thumb is ignored. Fingers must point roughly upward.
+     * The thumb is ignored. Fingers must point roughly upward. "Strong" means every finger
+     * is clearly extended or clearly folded, which is safe to act on from a single frame.
      */
-    private fun classifyPose(hand: List<NormalizedLandmark>): PoseTrigger.Pose? {
+    private fun classifyPose(hand: List<NormalizedLandmark>): Detection? {
         val aspect = frameAspect
         fun distFromWrist(i: Int) =
             hypot((hand[i].x() - hand[0].x()) * aspect, hand[i].y() - hand[0].y())
-        fun extended(tip: Int, pip: Int) = distFromWrist(tip) > distFromWrist(pip) * 1.2f
-        fun folded(tip: Int, pip: Int) = distFromWrist(tip) < distFromWrist(pip) * 1.1f
+        // tip-to-wrist vs knuckle-to-wrist: >1 when the finger is straight, <1 when curled.
+        fun ratio(tip: Int, pip: Int) = distFromWrist(tip) / distFromWrist(pip).coerceAtLeast(1e-4f)
         fun pointsUp(tip: Int, mcp: Int) = hand[tip].y() < hand[mcp].y()
 
-        val index = extended(8, 6) && pointsUp(8, 5)
-        val ringPinkyFolded = folded(16, 14) && folded(20, 18)
-        if (!index || !ringPinkyFolded) return null
+        val index = ratio(8, 6)
+        val middle = ratio(12, 10)
+        val ring = ratio(16, 14)
+        val pinky = ratio(20, 18)
+        if (index <= 1.2f || !pointsUp(8, 5) || ring >= 1.1f || pinky >= 1.1f) return null
+        val othersClearlyFolded = ring < 0.95f && pinky < 0.95f
         return when {
-            folded(12, 10) -> PoseTrigger.Pose.ONE_FINGER
-            extended(12, 10) && pointsUp(12, 9) -> PoseTrigger.Pose.TWO_FINGERS
+            middle < 1.1f -> Detection(
+                PoseTrigger.Pose.ONE_FINGER,
+                strong = index > 1.35f && middle < 0.95f && othersClearlyFolded,
+            )
+            middle > 1.2f && pointsUp(12, 9) -> Detection(
+                PoseTrigger.Pose.TWO_FINGERS,
+                strong = index > 1.35f && middle > 1.35f && othersClearlyFolded,
+            )
             else -> null
         }
     }
 
-    private fun performScroll(pose: PoseTrigger.Pose) {
+    private fun performScroll(pose: PoseTrigger.Pose, frameTimeMs: Long) {
         val scroller = ReelScrollService.instance
         if (scroller == null) {
             status = "Accessibility service is off — enable it in the app"
             return
         }
         val next = pose == PoseTrigger.Pose.ONE_FINGER
-        if (scroller.scroll(next, Prefs.instagramOnly(this))) {
+        if (scroller.scroll(next, Prefs.instagramOnly(this), Prefs.scrollBySwipe(this))) {
+            lastScrollDelayMs = SystemClock.uptimeMillis() - frameTimeMs
+            updateSpeedInfo()
             handState = if (next) "Scrolled to next reel" else "Scrolled to previous reel"
         }
+    }
+
+    private fun updateSpeedInfo() {
+        val last = lastScrollDelayMs
+        speedInfo = "Model ${modelMsAvg.toInt()} ms/frame" +
+            if (last >= 0) " · last scroll ${last} ms after the frame" else ""
     }
 
     private fun failAndStop(message: String) {
@@ -540,6 +577,7 @@ class GestureCameraService : LifecycleService() {
             runCatching { model?.close() }
         }
         handState = ""
+        speedInfo = ""
         if (!failed) status = "Stopped"
         super.onDestroy()
     }

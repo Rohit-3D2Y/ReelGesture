@@ -78,6 +78,12 @@
             android:layout_height="wrap_content"
             android:text="✌ two fingers = previous reel" />
 
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/scrollBySwipeSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Scroll by swipe (try this if reels go black)" />
+
         <!-- Step 3 -->
         <Button
             android:id="@+id/startStopButton"

@@ -69,6 +69,10 @@ class MainActivity : AppCompatActivity() {
             isChecked = Prefs.allowPrevious(context)
             setOnCheckedChangeListener { _, checked -> Prefs.setAllowPrevious(context, checked) }
         }
+        findViewById<SwitchCompat>(R.id.scrollBySwipeSwitch).apply {
+            isChecked = Prefs.scrollBySwipe(context)
+            setOnCheckedChangeListener { _, checked -> Prefs.setScrollBySwipe(context, checked) }
+        }
     }
 
     override fun onResume() {
@@ -123,7 +127,10 @@ class MainActivity : AppCompatActivity() {
         }
         val hand = GestureCameraService.handState
         serviceStatus.text = "Status: ${GestureCameraService.status}" +
-            if (GestureCameraService.isRunning && hand.isNotEmpty()) "\nCamera sees: $hand" else ""
+            (if (GestureCameraService.isRunning && hand.isNotEmpty()) "\nCamera sees: $hand" else "") +
+            GestureCameraService.speedInfo.let {
+                if (GestureCameraService.isRunning && it.isNotEmpty()) "\nSpeed: $it" else ""
+            }
         startStopButton.text = if (GestureCameraService.isRunning) "Stop gesture control" else "Start gesture control"
     }
 
