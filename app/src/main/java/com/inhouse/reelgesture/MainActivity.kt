@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
@@ -23,6 +24,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraStatus: TextView
     private lateinit var accessibilityStatus: TextView
     private lateinit var serviceStatus: TextView
+    private lateinit var batteryStatus: TextView
     private lateinit var startStopButton: Button
 
     private val refreshHandler = Handler(Looper.getMainLooper())
@@ -43,6 +45,7 @@ class MainActivity : AppCompatActivity() {
         cameraStatus = findViewById(R.id.cameraStatus)
         accessibilityStatus = findViewById(R.id.accessibilityStatus)
         serviceStatus = findViewById(R.id.serviceStatus)
+        batteryStatus = findViewById(R.id.batteryStatus)
         startStopButton = findViewById(R.id.startStopButton)
 
         findViewById<Button>(R.id.grantCameraButton).setOnClickListener { requestPermissions() }
@@ -57,6 +60,7 @@ class MainActivity : AppCompatActivity() {
             if (launch == null) toast("Instagram is not installed") else safeStart(launch)
         }
         startStopButton.setOnClickListener { toggleService() }
+        findViewById<Button>(R.id.batteryButton).setOnClickListener { requestNoBatteryLimits() }
 
         findViewById<SwitchCompat>(R.id.instagramOnlySwitch).apply {
             isChecked = Prefs.instagramOnly(context)
@@ -118,7 +122,30 @@ class MainActivity : AppCompatActivity() {
         refreshHandler.postDelayed({ refresh() }, 300)
     }
 
+    private fun ignoresBatteryLimits() =
+        getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) == true
+
+    private fun requestNoBatteryLimits() {
+        if (ignoresBatteryLimits()) {
+            // Already exempt from Android's limits; vendor battery savers live in App info.
+            safeStart(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+            return
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (e: Exception) {
+            safeStart(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+
     private fun refresh() {
+        batteryStatus.text = if (ignoresBatteryLimits()) {
+            "✅ No battery limits (stays quick after long reels)"
+        } else {
+            "⚠️ Battery limits on — may react slowly after a while"
+        }
         cameraStatus.text = if (hasCamera()) "✅ Camera permission granted" else "❌ Camera permission needed"
         accessibilityStatus.text = if (ReelScrollService.instance != null) {
             "✅ Accessibility service enabled"

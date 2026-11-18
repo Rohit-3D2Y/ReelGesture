@@ -73,6 +73,9 @@ class GestureCameraService : LifecycleService() {
         // While a hand is around, run the model on every frame it can keep up with.
         private const val ACTIVE_FRAME_INTERVAL_MS = 0L
         private const val IDLE_FRAME_INTERVAL_MS = 100L // 10 cheap motion checks/s otherwise
+        // Run the model at least this often even with no motion, so it stays warm in memory
+        // and the first ☝ after a long reel is recognised immediately.
+        private const val KEEP_WARM_INTERVAL_MS = 1000L
         private const val HAND_ACTIVE_HOLD_MS = 2000L
         private const val STUCK_FRAME_TIMEOUT_MS = 1000L
         private const val CAMERA_OFF_DELAY_MS = 1500L
@@ -128,6 +131,7 @@ class GestureCameraService : LifecycleService() {
     @Volatile private var lastHandSeenMs = 0L
     @Volatile private var frameAspect = 0.75f
     private var lastCheckMs = 0L
+    private var lastModelRunMs = 0L
     private var started = false
     private var failed = false
 
@@ -375,7 +379,7 @@ class GestureCameraService : LifecycleService() {
 
             // Cheap gate: with no hand around, only wake the model when something moves.
             val moved = motionDetected(proxy)
-            if (!handActive && !moved) return
+            if (!handActive && !moved && now - lastModelRunMs < KEEP_WARM_INTERVAL_MS) return
 
             val inFlight = frameInFlightSince
             if (inFlight != 0L && now - inFlight < STUCK_FRAME_TIMEOUT_MS) return // model still busy
@@ -384,6 +388,7 @@ class GestureCameraService : LifecycleService() {
             val bitmap = uprightBitmap(proxy)
             frameAspect = bitmap.width.toFloat() / bitmap.height
             frameInFlightSince = now
+            lastModelRunMs = now
             model.detectAsync(BitmapImageBuilder(bitmap).build(), now)
         } catch (e: Throwable) {
             Log.w(TAG, "Frame skipped", e)
