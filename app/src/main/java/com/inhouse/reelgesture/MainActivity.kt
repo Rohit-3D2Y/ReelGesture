@@ -61,7 +61,10 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<SwitchCompat>(R.id.instagramOnlySwitch).apply {
             isChecked = Prefs.instagramOnly(context)
-            setOnCheckedChangeListener { _, checked -> Prefs.setInstagramOnly(context, checked) }
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setInstagramOnly(context, checked)
+                GestureCameraService.onSettingsChanged()
+            }
         }
         findViewById<SwitchCompat>(R.id.allowPreviousSwitch).apply {
             isChecked = Prefs.allowPrevious(context)
@@ -129,7 +132,9 @@ class MainActivity : AppCompatActivity() {
         } else {
             "❌ Accessibility service off"
         }
-        serviceStatus.text = "Status: ${GestureCameraService.status}"
+        val hand = GestureCameraService.handState
+        serviceStatus.text = "Status: ${GestureCameraService.status}" +
+            if (GestureCameraService.isRunning && hand.isNotEmpty()) "\nCamera sees: $hand" else ""
         startStopButton.text = if (GestureCameraService.isRunning) "Stop gesture control" else "Start gesture control"
     }
 

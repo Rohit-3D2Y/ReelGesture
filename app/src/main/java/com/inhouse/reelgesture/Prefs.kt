@@ -22,10 +22,10 @@ object Prefs {
         prefs(context).edit().putBoolean(KEY_ALLOW_PREVIOUS, value).apply()
 
     /** 0..100, higher = smaller hand movement needed. */
-    fun sensitivity(context: Context) = prefs(context).getInt(KEY_SENSITIVITY, 50)
+    fun sensitivity(context: Context) = prefs(context).getInt(KEY_SENSITIVITY, 60)
     fun setSensitivity(context: Context, value: Int) =
         prefs(context).edit().putInt(KEY_SENSITIVITY, value.coerceIn(0, 100)).apply()
 
-    /** Fraction of frame height the hand must travel to count as a swipe. */
-    fun swipeThreshold(context: Context): Float = 0.40f - 0.30f * sensitivity(context) / 100f
+    /** Fraction of frame height the fingertips must travel to count as a swipe (0.05..0.20). */
+    fun swipeThreshold(context: Context): Float = 0.20f - 0.15f * sensitivity(context) / 100f
 }

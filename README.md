@@ -1,6 +1,6 @@
 # Reel Gesture (in-house)
 
-Scroll Instagram Reels hands-free. Move your hand **up** in front of the phone's front camera to go to the next reel. You can optionally turn on hand **down** to go back to the previous reel.
+Scroll Instagram Reels hands-free. Show **two fingers (✌)** to the front camera and move them **up** slightly to go to the next reel. You can optionally turn on moving them **down** to go back to the previous reel.
 
 ## How it works
 - `GestureCameraService` is a foreground service with the `camera` type. It reads the front camera at about 640×480, capped at 15 fps, and runs the MediaPipe **Hand Landmarker** on the CPU. It tracks the palm position over time.
@@ -10,7 +10,8 @@ Scroll Instagram Reels hands-free. Move your hand **up** in front of the phone's
 ## Stability safeguards
 - All camera, ML, and gesture calls are guarded. A failure shows up as a status message in the app instead of a crash.
 - If another app is using the camera, the service waits and reconnects automatically.
-- In "Instagram only" mode, no ML work runs while Instagram isn't on screen.
+- The camera is fully closed while Instagram is not on screen or the phone is locked.
+- With no hand in view, only a cheap motion check runs (4 times a second). The hand model wakes up only on movement, at 320×240 and about 11 fps, on a background-priority thread.
 - Only one frame is processed at a time, and stalled frames are dropped. Memory stays flat.
 - The service never restarts itself in a loop. Stop it from the notification or from the app.
 - `gradle.properties` limits the Gradle heap to 2 GB so builds don't starve other processes on the PC.

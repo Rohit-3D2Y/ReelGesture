@@ -1,20 +1,33 @@
 package com.inhouse.reelgesture
 
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.util.Size
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
 import androidx.camera.core.ImageAnalysis
@@ -27,6 +40,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -34,11 +48,20 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.hypot
 
 /**
- * Foreground service that watches the front camera for a hand swipe and asks
- * [ReelScrollService] to scroll. Every failure path degrades to a status message
- * instead of crashing, and the camera is released as soon as the service stops.
+ * Foreground service that watches the front camera for a two-finger (✌) upward flick
+ * and asks [ReelScrollService] to scroll.
+ *
+ * Battery/CPU budget:
+ * - The camera is fully closed while Instagram is not on screen or the phone is locked.
+ * - The hand model only runs when the cheap motion check sees movement (idle) or a hand
+ *   was seen in the last couple of seconds (active), at low resolution and low frame rate.
+ * - Analysis runs on a background-priority thread so Instagram and audio keep priority.
+ *
+ * Every failure path degrades to a status message instead of crashing.
  */
 class GestureCameraService : LifecycleService() {
 
@@ -47,11 +70,16 @@ class GestureCameraService : LifecycleService() {
         private const val CHANNEL_ID = "gesture_camera"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "com.inhouse.reelgesture.STOP"
-        private const val MIN_FRAME_INTERVAL_MS = 66L // ~15 fps cap keeps CPU/battery use low
-        private const val STUCK_FRAME_TIMEOUT_MS = 1000L
 
-        // Palm landmarks: wrist + base of each finger. More stable than a fingertip.
-        private val PALM_LANDMARKS = intArrayOf(0, 5, 9, 13, 17)
+        private const val ACTIVE_FRAME_INTERVAL_MS = 90L // ~11 fps while a hand is around
+        private const val IDLE_FRAME_INTERVAL_MS = 250L // 4 cheap motion checks/s otherwise
+        private const val HAND_ACTIVE_HOLD_MS = 2000L
+        private const val STUCK_FRAME_TIMEOUT_MS = 1000L
+        private const val CAMERA_OFF_DELAY_MS = 1500L
+
+        private const val GRID_W = 24
+        private const val GRID_H = 18
+        private const val MOTION_THRESHOLD = 6 // mean abs green-channel change, 0..255
 
         @Volatile
         var isRunning = false
@@ -62,6 +90,14 @@ class GestureCameraService : LifecycleService() {
         var status: String = "Stopped"
             private set
 
+        /** Live hand-tracking readout for the UI. */
+        @Volatile
+        var handState: String = ""
+            private set
+
+        @Volatile
+        private var current: GestureCameraService? = null
+
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, GestureCameraService::class.java))
         }
@@ -69,22 +105,47 @@ class GestureCameraService : LifecycleService() {
         fun stop(context: Context) {
             context.stopService(Intent(context, GestureCameraService::class.java))
         }
+
+        /** Re-check whether the camera should be on (e.g. "Instagram only" toggled). */
+        fun onSettingsChanged() {
+            current?.scheduleCameraUpdate()
+        }
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var analysisExecutor: ExecutorService? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var cameraBound = false
+    private var receiverRegistered = false
     @Volatile private var landmarker: HandLandmarker? = null
     @Volatile private var frameInFlightSince = 0L
-    private var lastFrameMs = 0L
+    @Volatile private var lastHandSeenMs = 0L
+    @Volatile private var frameAspect = 0.75f
+    private var lastCheckMs = 0L
     private var started = false
     private var failed = false
+    private var poseFrames = 0
+
+    // Reused per-frame buffers (analysis thread only) to avoid garbage every frame.
+    private var gridPrev = IntArray(GRID_W * GRID_H)
+    private var gridCur = IntArray(GRID_W * GRID_H)
+    private var hasPrevGrid = false
+    private var sourceBitmap: Bitmap? = null
+    private var rotatedBitmap: Bitmap? = null
+    private val rotateMatrix = Matrix()
 
     private val detector = SwipeDetector(
         threshold = { Prefs.swipeThreshold(this) },
         allowDown = { Prefs.allowPrevious(this) },
         onSwipe = { direction -> mainHandler.post { performScroll(direction) } },
     )
+
+    private val applyCameraTask = Runnable { applyCameraState() }
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) = scheduleCameraUpdate()
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -94,20 +155,28 @@ class GestureCameraService : LifecycleService() {
         }
         if (started) return START_NOT_STICKY
 
-        if (!goForeground("Watching for hand swipes")) {
+        if (!goForeground("Watching for ✌ two fingers")) {
             stopSelf()
             return START_NOT_STICKY
         }
         started = true
         isRunning = true
         failed = false
+        current = this
         status = "Starting…"
 
-        analysisExecutor = Executors.newSingleThreadExecutor()
+        analysisExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread({
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                runnable.run()
+            }, "gesture-analysis")
+        }
         if (!createLandmarker()) {
             stopSelf()
             return START_NOT_STICKY
         }
+        registerScreenReceiver()
+        ReelScrollService.onForegroundChanged = { scheduleCameraUpdate() }
         startCamera()
         // No auto-restart after the system kills us: on Android 14+ a camera service
         // cannot legally start from the background, and a restart loop would be noisy.
@@ -159,6 +228,21 @@ class GestureCameraService : LifecycleService() {
         false
     }
 
+    private fun registerScreenReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        try {
+            ContextCompat.registerReceiver(this, screenReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            receiverRegistered = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Screen receiver not registered", e)
+        }
+    }
+
+    @OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun startCamera() {
         val future = try {
             ProcessCameraProvider.getInstance(this)
@@ -169,35 +253,99 @@ class GestureCameraService : LifecycleService() {
         future.addListener({
             if (!isRunning) return@addListener
             try {
-                val provider = future.get()
-                cameraProvider = provider
+                cameraProvider = future.get()
 
-                val analysis = ImageAnalysis.Builder()
+                val builder = ImageAnalysis.Builder()
                     .setResolutionSelector(
                         ResolutionSelector.Builder()
                             .setResolutionStrategy(
                                 ResolutionStrategy(
-                                    Size(640, 480),
-                                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER,
+                                    Size(320, 240),
+                                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
                                 )
                             )
                             .build()
                     )
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .build()
+                lowFpsRange()?.let {
+                    Camera2Interop.Extender(builder)
+                        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+                }
+                val analysis = builder.build()
                 analysisExecutor?.let { analysis.setAnalyzer(it, ::analyzeFrame) }
+                imageAnalysis = analysis
 
-                provider.unbindAll()
-                val camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
-                camera.cameraInfo.cameraState.observe(this) { state -> onCameraState(state) }
+                cameraProvider?.unbindAll()
+                applyCameraState()
             } catch (e: Exception) {
                 failAndStop("Could not open front camera: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
+    /** The lowest supported front-camera frame-rate range that still reaches 10 fps. */
+    private fun lowFpsRange(): Range<Int>? = try {
+        val manager = getSystemService(CameraManager::class.java)
+        val frontId = manager?.cameraIdList?.firstOrNull {
+            manager.getCameraCharacteristics(it)
+                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        }
+        frontId?.let { id ->
+            manager.getCameraCharacteristics(id)
+                .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.filter { it.upper >= 10 }
+                ?.minWithOrNull(compareBy<Range<Int>>({ it.upper }, { -it.lower }))
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Could not read fps ranges", e)
+        null
+    }
+
+    /** Camera is only needed while the screen is on, unlocked, and (optionally) on Instagram. */
+    private fun wantCamera(): Boolean {
+        if (!isRunning) return false
+        if (getSystemService(PowerManager::class.java)?.isInteractive == false) return false
+        if (getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true) return false
+        if (!Prefs.instagramOnly(this)) return true
+        val fg = ReelScrollService.foregroundPackage ?: return true
+        return fg == Prefs.INSTAGRAM_PACKAGE
+    }
+
+    fun scheduleCameraUpdate() {
+        mainHandler.removeCallbacks(applyCameraTask)
+        // Turn on immediately; turn off after a short delay so quick app switches don't thrash the camera.
+        mainHandler.postDelayed(applyCameraTask, if (wantCamera()) 0L else CAMERA_OFF_DELAY_MS)
+    }
+
+    private fun applyCameraState() {
+        val provider = cameraProvider ?: return
+        val analysis = imageAnalysis ?: return
+        try {
+            if (wantCamera()) {
+                if (!cameraBound) {
+                    val camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                    camera.cameraInfo.cameraState.removeObservers(this)
+                    camera.cameraInfo.cameraState.observe(this) { state -> onCameraState(state) }
+                    cameraBound = true
+                    updateNotification("Watching for ✌ two fingers")
+                }
+            } else if (cameraBound) {
+                provider.unbindAll()
+                cameraBound = false
+                status = "Paused — camera off until Instagram is open"
+                handState = ""
+                updateNotification("Paused — camera off")
+            } else if (status == "Starting…") {
+                status = "Paused — camera off until Instagram is open"
+            }
+        } catch (e: Exception) {
+            failAndStop("Could not open front camera: ${e.message}")
+        }
+    }
+
     private fun onCameraState(state: CameraState) {
+        if (!cameraBound) return
         val error = state.error
         status = when {
             error?.code == CameraState.ERROR_CAMERA_IN_USE ||
@@ -207,7 +355,7 @@ class GestureCameraService : LifecycleService() {
             error?.code == CameraState.ERROR_CAMERA_DISABLED ->
                 "Camera disabled by device policy"
             error != null -> "Camera error ${error.code} — retrying…"
-            state.type == CameraState.Type.OPEN -> "Running — swipe your hand up for the next reel"
+            state.type == CameraState.Type.OPEN -> "Running — show ✌ two fingers and move them up"
             state.type == CameraState.Type.OPENING ||
                 state.type == CameraState.Type.PENDING_OPEN -> "Opening camera…"
             else -> status
@@ -217,17 +365,20 @@ class GestureCameraService : LifecycleService() {
     private fun analyzeFrame(proxy: ImageProxy) {
         try {
             val now = SystemClock.uptimeMillis()
-            if (now - lastFrameMs < MIN_FRAME_INTERVAL_MS) return
-            if (!shouldWatchNow()) {
-                detector.reset()
-                return
-            }
+            val handActive = now - lastHandSeenMs < HAND_ACTIVE_HOLD_MS
+            if (now - lastCheckMs < if (handActive) ACTIVE_FRAME_INTERVAL_MS else IDLE_FRAME_INTERVAL_MS) return
+            lastCheckMs = now
+
+            // Cheap gate: with no hand around, only wake the model when something moves.
+            val moved = motionDetected(proxy)
+            if (!handActive && !moved) return
+
             val inFlight = frameInFlightSince
             if (inFlight != 0L && now - inFlight < STUCK_FRAME_TIMEOUT_MS) return // model still busy
             val model = landmarker ?: return
-            lastFrameMs = now
 
             val bitmap = uprightBitmap(proxy)
+            frameAspect = bitmap.width.toFloat() / bitmap.height
             frameInFlightSince = now
             model.detectAsync(BitmapImageBuilder(bitmap).build(), now)
         } catch (e: Throwable) {
@@ -238,21 +389,59 @@ class GestureCameraService : LifecycleService() {
         }
     }
 
-    /** Skip all ML work (saves battery/CPU) unless Instagram is on screen in Instagram-only mode. */
-    private fun shouldWatchNow(): Boolean {
-        if (!Prefs.instagramOnly(this)) return true
-        val fg = ReelScrollService.foregroundPackage ?: return true
-        return fg == Prefs.INSTAGRAM_PACKAGE
+    /** Compares a coarse grid of green-channel samples with the previous check. */
+    private fun motionDetected(proxy: ImageProxy): Boolean {
+        val plane = proxy.planes[0]
+        val buffer = plane.buffer
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        val w = proxy.width
+        val h = proxy.height
+        var diff = 0L
+        var i = 0
+        for (gy in 0 until GRID_H) {
+            val row = ((gy * 2 + 1) * h / (GRID_H * 2)) * rowStride
+            for (gx in 0 until GRID_W) {
+                val x = (gx * 2 + 1) * w / (GRID_W * 2)
+                val value = buffer.get(row + x * pixelStride + 1).toInt() and 0xFF
+                gridCur[i] = value
+                diff += abs(value - gridPrev[i])
+                i++
+            }
+        }
+        val hadPrev = hasPrevGrid
+        val swap = gridPrev
+        gridPrev = gridCur
+        gridCur = swap
+        hasPrevGrid = true
+        return !hadPrev || diff / (GRID_W * GRID_H) > MOTION_THRESHOLD
     }
 
+    /** Upright RGBA bitmap of the frame, drawn into reused bitmaps. */
     private fun uprightBitmap(proxy: ImageProxy): Bitmap {
-        val source = proxy.toBitmap()
+        val w = proxy.width
+        val h = proxy.height
+        val plane = proxy.planes[0]
+        val source = if (plane.pixelStride == 4 && plane.rowStride == w * 4) {
+            val bmp = sourceBitmap?.takeIf { it.width == w && it.height == h }
+                ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { sourceBitmap = it }
+            plane.buffer.rewind()
+            bmp.copyPixelsFromBuffer(plane.buffer)
+            bmp
+        } else {
+            proxy.toBitmap()
+        }
+
         val rotation = proxy.imageInfo.rotationDegrees
         if (rotation == 0) return source
-        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-        val rotated = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, false)
-        if (rotated !== source) source.recycle()
-        return rotated
+        val (outW, outH) = if (rotation == 90 || rotation == 270) h to w else w to h
+        val out = rotatedBitmap?.takeIf { it.width == outW && it.height == outH }
+            ?: Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888).also { rotatedBitmap = it }
+        rotateMatrix.reset()
+        rotateMatrix.postRotate(rotation.toFloat(), w / 2f, h / 2f)
+        rotateMatrix.postTranslate((outW - w) / 2f, (outH - h) / 2f)
+        Canvas(out).drawBitmap(source, rotateMatrix, null)
+        return out
     }
 
     private fun onHandResult(result: HandLandmarkerResult) {
@@ -260,14 +449,37 @@ class GestureCameraService : LifecycleService() {
         try {
             val hand = result.landmarks().firstOrNull()
             if (hand == null || hand.size < 21) {
+                poseFrames = 0
                 detector.reset()
+                handState = "No hand in view"
                 return
             }
-            val y = PALM_LANDMARKS.map { hand[it].y() }.average().toFloat()
+            lastHandSeenMs = SystemClock.uptimeMillis()
+            if (!isTwoFingerPose(hand)) {
+                poseFrames = 0
+                detector.reset()
+                handState = "Hand seen — show ✌ two fingers"
+                return
+            }
+            poseFrames++
+            handState = "✌ Two fingers — move them up"
+            if (poseFrames < 2) return // ignore single-frame pose flickers
+            // Track the index + middle fingertips.
+            val y = (hand[8].y() + hand[12].y()) / 2f
             detector.add(result.timestampMs(), y)
         } catch (e: Exception) {
             Log.w(TAG, "Bad hand result", e)
         }
+    }
+
+    /** Index and middle fingers extended, ring and pinky folded. Thumb is ignored. */
+    private fun isTwoFingerPose(hand: List<NormalizedLandmark>): Boolean {
+        val aspect = frameAspect
+        fun distFromWrist(i: Int) =
+            hypot((hand[i].x() - hand[0].x()) * aspect, hand[i].y() - hand[0].y())
+        fun extended(tip: Int, pip: Int) = distFromWrist(tip) > distFromWrist(pip) * 1.25f
+        fun folded(tip: Int, pip: Int) = distFromWrist(tip) < distFromWrist(pip) * 1.05f
+        return extended(8, 6) && extended(12, 10) && folded(16, 14) && folded(20, 18)
     }
 
     private fun performScroll(direction: SwipeDetector.Direction) {
@@ -278,7 +490,7 @@ class GestureCameraService : LifecycleService() {
         }
         val next = direction == SwipeDetector.Direction.UP
         if (scroller.scroll(next, Prefs.instagramOnly(this))) {
-            updateNotification(if (next) "Last: next reel" else "Last: previous reel")
+            handState = if (next) "Scrolled to next reel" else "Scrolled to previous reel"
         }
     }
 
@@ -292,12 +504,22 @@ class GestureCameraService : LifecycleService() {
     override fun onDestroy() {
         isRunning = false
         started = false
+        if (current === this) current = null
+        ReelScrollService.onForegroundChanged = null
+        if (receiverRegistered) {
+            runCatching { unregisterReceiver(screenReceiver) }
+            receiverRegistered = false
+        }
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             cameraProvider?.unbindAll()
         } catch (e: Exception) {
             Log.w(TAG, "Unbind failed", e)
         }
+        cameraBound = false
         cameraProvider = null
+        imageAnalysis?.clearAnalyzer()
+        imageAnalysis = null
         // Close the model on the analysis thread so it never races an in-progress frame.
         val model = landmarker
         landmarker = null
@@ -313,7 +535,7 @@ class GestureCameraService : LifecycleService() {
         } else {
             runCatching { model?.close() }
         }
-        mainHandler.removeCallbacksAndMessages(null)
+        handState = ""
         if (!failed) status = "Stopped"
         super.onDestroy()
     }
@@ -334,7 +556,7 @@ class GestureCameraService : LifecycleService() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Reel Gesture is using the camera")
+            .setContentTitle("Reel Gesture")
             .setContentText(text)
             .setContentIntent(openApp)
             .addAction(0, "Stop", stop)

@@ -1,8 +1,8 @@
 package com.inhouse.reelgesture
 
 /**
- * Turns a stream of hand vertical positions (normalized 0 = top, 1 = bottom)
- * into discrete UP / DOWN swipe events.
+ * Turns a stream of fingertip vertical positions (normalized 0 = top, 1 = bottom),
+ * fed only while the two-finger pose is held, into discrete UP / DOWN swipe events.
  */
 class SwipeDetector(
     private val threshold: () -> Float,
@@ -11,8 +11,8 @@ class SwipeDetector(
 ) {
     enum class Direction { UP, DOWN }
 
-    private val windowMs = 450L
-    private val cooldownMs = 800L
+    private val windowMs = 600L
+    private val cooldownMs = 900L
     // After a swipe, ignore the opposite direction longer so the hand's return stroke isn't counted.
     private val reverseLockoutMs = 1500L
 
@@ -29,11 +29,11 @@ class SwipeDetector(
         }
         samples.addLast(timeMs to y)
         while (samples.isNotEmpty() && timeMs - samples.first().first > windowMs) samples.removeFirst()
-        if (samples.size < 3) return
+        if (samples.size < 2) return
 
         val t = threshold()
-        val rise = samples.maxOf { it.second } - y // hand moved up
-        val fall = y - samples.minOf { it.second } // hand moved down
+        val rise = samples.maxOf { it.second } - y // fingers moved up
+        val fall = y - samples.minOf { it.second } // fingers moved down
 
         val direction = when {
             rise > t -> Direction.UP
